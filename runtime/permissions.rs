@@ -27,6 +27,14 @@ use std::sync::atomic::AtomicBool;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 
+use anyhow;
+
+use sandboxer::policy::read_policy_from_file;
+use sandboxer::policy::{Policy, PolicyIdentifiers, PolicyVec, PolicyVectors};
+use sandboxer::policy::{MAX_DEPTH, POLICY_VECTOR};
+
+use sandboxer::bpf::enforcer;
+
 const PERMISSION_EMOJI: &str = "⚠️";
 
 lazy_static::lazy_static! {
@@ -970,6 +978,90 @@ impl Default for UnaryPermission<RunDescriptor> {
   }
 }
 
+impl UnaryPermission<PolicyIdentifiers> {
+  pub fn query(&self, cmd: Option<&str>) -> PermissionState {
+    match cmd {
+      Some(id) => {
+        let searched_policy = PolicyIdentifiers {
+          policy_name: String::from(id),
+          ..Default::default()
+        };
+        if self.granted_list.contains(&searched_policy) {
+          return PermissionState::Granted;
+        }
+        return PermissionState::Denied;
+      }
+      None => return PermissionState::Denied,
+    }
+  }
+
+  // TODO: state that this cannot be implemented
+  pub fn request(&mut self, cmd: Option<&str>) -> PermissionState {
+    // The policy cannot change over time
+    PermissionState::Denied
+  }
+
+  // TODO: Implement the actual method if necessary or state otherwise
+  pub fn revoke(&mut self, cmd: Option<&str>) -> PermissionState {
+    // Cannot rewoke the policy
+    PermissionState::Denied
+  }
+
+  pub fn check(&mut self, cmd: &str) -> Result<&PolicyIdentifiers, AnyError> {
+    // Just query the policy and return an error if no
+    // policy is found
+    let (result, prompted) = self.query(Some(cmd)).check(
+      self.name,
+      Some(&format!("\"{}\"", cmd)),
+      self.prompt,
+    );
+    result?;
+    // If we are here, no error has been raised
+    let result_policy = PolicyIdentifiers {
+      policy_name: String::from(cmd),
+      ..Default::default()
+    };
+
+    let to_return = self.granted_list.get(&result_policy);
+    match to_return {
+      Some(policy) => return Ok(policy),
+      None => {
+        return Err(anyhow::Error::new(std::io::Error::new(
+          std::io::ErrorKind::Other,
+          "Policy not found",
+        )))
+      }
+    }
+  }
+
+  // TODO: don't think it can be usefull, but it is better to implement it
+  pub fn check_all(&mut self) -> Result<(), AnyError> {
+    let (result, prompted) =
+      self.query(None).check(self.name, Some("all"), self.prompt);
+    if prompted {
+      if result.is_ok() {
+        self.global_state = PermissionState::Granted;
+      } else {
+        self.global_state = PermissionState::Denied;
+      }
+    }
+    result
+  }
+}
+
+impl Default for UnaryPermission<PolicyIdentifiers> {
+  fn default() -> Self {
+    UnaryPermission::<PolicyIdentifiers> {
+      name: "policy",
+      description: "get policy for subprocesses",
+      global_state: Default::default(),
+      granted_list: Default::default(),
+      denied_list: Default::default(),
+      prompt: false,
+    }
+  }
+}
+
 impl UnaryPermission<FfiDescriptor> {
   pub fn query(&self, path: Option<&Path>) -> PermissionState {
     let path = path.map(|p| resolve_from_cwd(p).unwrap());
@@ -1098,6 +1190,8 @@ pub struct Permissions {
   pub run: UnaryPermission<RunDescriptor>,
   pub ffi: UnaryPermission<FfiDescriptor>,
   pub hrtime: UnitPermission,
+  pub policy: UnaryPermission<PolicyIdentifiers>,
+  pub strict: UnitPermission,
 }
 
 impl Default for Permissions {
@@ -1110,6 +1204,8 @@ impl Default for Permissions {
       run: Permissions::new_run(&None, false),
       ffi: Permissions::new_ffi(&None, false),
       hrtime: Permissions::new_hrtime(false, false),
+      policy: Permissions::new_policy(&None, false),
+      strict: Permissions::new_strict(false, false),
     }
   }
 }
@@ -1124,6 +1220,8 @@ pub struct PermissionsOptions {
   pub allow_run: Option<Vec<String>>,
   pub allow_write: Option<Vec<PathBuf>>,
   pub prompt: bool,
+  pub policy_file: Option<Vec<PathBuf>>,
+  pub strict: bool,
 }
 
 impl Permissions {
@@ -1225,6 +1323,88 @@ impl Permissions {
     )
   }
 
+  /// Problem: Using a file is not very cohesive with general Deno design
+  /// This method is called two times but one time
+  /// Option is None, so the policy does not change
+  pub fn new_policy(
+    state: &Option<Vec<PathBuf>>,
+    prompt: bool,
+  ) -> UnaryPermission<PolicyIdentifiers> {
+    let mut bpf_need = false;
+
+    let mut policy_vec: PolicyVec = match state {
+      Some(paths) => {
+        let mut res = PolicyVec {
+          policies: vec![],
+          max_depth: 1,
+        };
+        for path in paths.iter() {
+          res = match read_policy_from_file(path) {
+            Ok(policy) => policy,
+            Err(error) => panic!("{:?}", error),
+          };
+        }
+        res
+      }
+      None => PolicyVec {
+        policies: vec![],
+        max_depth: 1,
+      },
+    };
+
+    let mut policy_set: HashSet<PolicyIdentifiers> = HashSet::new();
+    let mut i: u32 = 0;
+
+    // Update the max depth of the deny list
+    unsafe {
+      MAX_DEPTH = policy_vec.max_depth + 1;
+    }
+
+    while !policy_vec.policies.is_empty() {
+      let curr_policy: Policy = policy_vec.policies.remove(0 as usize);
+      let pol_id = PolicyIdentifiers {
+        policy_name: String::from(&curr_policy.policy_name),
+        kernel_id: Some(i),
+      };
+      policy_set.insert(pol_id);
+
+      // Check if at least one policy has one element in the denied list
+      if !bpf_need && curr_policy.deny.is_some() {
+        let curr_denied: &Vec<String> = curr_policy.deny.as_ref().unwrap();
+        bpf_need = bpf_need || curr_denied.len() > 0;
+      }
+
+      unsafe {
+        POLICY_VECTOR.insert(i as usize, PolicyVectors::from(curr_policy));
+      }
+
+      i += 1;
+    }
+
+    if state.is_some() && bpf_need {
+      match enforcer::enforce_denied_list() {
+        Ok(()) => (),
+        Err(e) => panic!("{}", e),
+      }
+    }
+
+    UnaryPermission::<PolicyIdentifiers> {
+      global_state: global_state_from_option(state),
+      granted_list: policy_set,
+      prompt,
+      ..Default::default()
+    }
+  }
+
+  pub fn new_strict(state: bool, prompt: bool) -> UnitPermission {
+    unit_permission_from_flag_bool(
+      state,
+      "strict",
+      "cage4denos strict mode",
+      prompt,
+    )
+  }
+
   pub fn from_options(opts: &PermissionsOptions) -> Self {
     Self {
       read: Permissions::new_read(&opts.allow_read, opts.prompt),
@@ -1234,6 +1414,8 @@ impl Permissions {
       run: Permissions::new_run(&opts.allow_run, opts.prompt),
       ffi: Permissions::new_ffi(&opts.allow_ffi, opts.prompt),
       hrtime: Permissions::new_hrtime(opts.allow_hrtime, opts.prompt),
+      policy: Permissions::new_policy(&opts.policy_file, opts.prompt),
+      strict: Permissions::new_strict(opts.strict, opts.prompt),
     }
   }
 
@@ -1246,6 +1428,8 @@ impl Permissions {
       run: Permissions::new_run(&Some(vec![]), false),
       ffi: Permissions::new_ffi(&Some(vec![]), false),
       hrtime: Permissions::new_hrtime(true, false),
+      policy: Permissions::new_policy(&None, false),
+      strict: Permissions::new_strict(true, false),
     }
   }
 

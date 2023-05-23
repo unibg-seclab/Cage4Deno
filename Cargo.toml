@@ -24,8 +24,13 @@ members = [
   "ext/webidl",
   "ext/websocket",
   "ext/webstorage",
+  "ext/sandboxer",
 ]
-exclude = ["test_util/std/hash/_wasm"]
+exclude = [
+  "test_util/std/hash/_wasm",
+  "examples/eBPF_tracer",
+  "examples/seccom_tracer"
+]
 
 # NB: the `bench` and `release` profiles must remain EXACTLY the same.
 [profile.release]

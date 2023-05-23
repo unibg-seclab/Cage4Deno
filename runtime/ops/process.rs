@@ -5,6 +5,7 @@ use super::io::ChildStdinResource;
 use super::io::ChildStdoutResource;
 use super::io::StdFileResource;
 use crate::permissions::Permissions;
+use anyhow;
 use deno_core::error::bad_resource_id;
 use deno_core::error::type_error;
 use deno_core::error::AnyError;
@@ -23,6 +24,9 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::rc::Rc;
 use tokio::process::Command;
+
+use sandboxer::boxer::sandboxer;
+use sandboxer::policy::PolicyIdentifiers;
 
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -63,6 +67,7 @@ pub struct RunArgs {
   cwd: Option<String>,
   clear_env: bool,
   env: Vec<(String, String)>,
+  policy_id: Option<String>,
   #[cfg(unix)]
   gid: Option<u32>,
   #[cfg(unix)]
@@ -107,8 +112,52 @@ fn op_run(
   run_args: RunArgs,
   _: (),
 ) -> Result<RunInfo, AnyError> {
+  let strict_mode = state.borrow_mut::<Permissions>().strict.check().is_ok();
+  //println!("strict_mode: {:#?}", strict_mode);
+
   let args = run_args.cmd;
-  state.borrow_mut::<Permissions>().run.check(&args[0])?;
+  // when in strict mode, override the policy_id to use the cmd name
+  let policy_id = if strict_mode {
+    Some(args[0].clone())
+  } else {
+    run_args.policy_id
+  };
+
+  //println!("policy_id: {:?}", policy_id);
+  /* TODO: these 2 checks have to be an OR in order to be compliant when no policy file is provided
+   *  AND to enforce the policy when it is actually provided in conjuntion with allow run
+   *  IMO if a binary has a policy attached it should not be also in the allow-run statement
+   *
+   */
+
+  let policy_perm = match policy_id {
+    Some(id) => state.borrow_mut::<Permissions>().policy.check(&id),
+    None => Err(anyhow::Error::new(std::io::Error::new(
+      std::io::ErrorKind::Other,
+      "Policy not provided",
+    ))),
+  };
+
+  // The landlock + eBPF cage is enabled
+  let cage: bool = match policy_perm {
+    Ok(_) => true,
+    Err(_) => false,
+  };
+
+  let mut policy_idx: Option<u32> = None;
+  // When there is the cage, only the policy is valid
+  if cage {
+    // This method create a temporary copy of the 3
+    // vectors used to define a landlock policy
+
+    let policy: &PolicyIdentifiers = policy_perm.unwrap();
+    policy_idx = policy.kernel_id;
+  }
+  // When there is no cage, simply let Deno do its normal check
+  else {
+    state.borrow_mut::<Permissions>().run.check(&args[0])?
+  }
+
   let env = run_args.env;
   let cwd = run_args.cwd;
 
@@ -139,8 +188,17 @@ fn op_run(
   }
   #[cfg(unix)]
   unsafe {
-    c.pre_exec(|| {
+    c.pre_exec(move || {
       libc::setgroups(0, std::ptr::null());
+      // Enforce landlock if in the cage
+      if cage {
+        match sandboxer(policy_idx) {
+          Ok(()) => (),
+          Err(e) => {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, e))
+          }
+        }
+      }
       Ok(())
     });
   }
@@ -169,9 +227,26 @@ fn op_run(
 
   // We want to kill child when it's closed
   c.kill_on_drop(true);
+  /*
+  let mut line = String::new();
+    println!("Read only paths (path1:path2:...)");
+    line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let ro = String::from(line.trim());
 
+    println!("Write only paths (path1:path2:...)");
+    line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let wo = String::from(line.trim());
+
+    println!("Read+Write paths (path1:path2:...)");
+    line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let rw = String::from(line.trim());
+  */
   // Spawn the command.
   let mut child = c.spawn()?;
+
   let pid = child.id();
 
   let stdin_rid = match child.stdin.take() {

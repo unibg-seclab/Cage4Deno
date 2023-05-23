@@ -202,6 +202,8 @@ pub struct Flags {
   pub allow_read: Option<Vec<PathBuf>>,
   pub allow_run: Option<Vec<String>>,
   pub allow_write: Option<Vec<PathBuf>>,
+  pub policy_file: Option<Vec<PathBuf>>,
+  pub strict: bool,
   pub ca_stores: Option<Vec<String>>,
   pub ca_file: Option<String>,
   pub cache_blocklist: Vec<String>,
@@ -349,6 +351,8 @@ impl From<Flags> for PermissionsOptions {
       allow_run: flags.allow_run,
       allow_write: flags.allow_write,
       prompt: flags.prompt,
+      policy_file: flags.policy_file,
+      strict: flags.strict,
     }
   }
 }
@@ -401,7 +405,6 @@ pub fn flags_from_vec(args: Vec<String>) -> clap::Result<Flags> {
     message: e.message.trim_start_matches("error: ").to_string(),
     ..e
   })?;
-
   let mut flags = Flags::default();
 
   if matches.is_present("unstable") {
@@ -1446,6 +1449,20 @@ fn permission_args<'a, 'b>(app: App<'a, 'b>) -> App<'a, 'b> {
         .help("Allow running subprocesses"),
     )
     .arg(
+      Arg::with_name("policy-file")
+        .long("policy-file")
+        .min_values(0)
+        .takes_value(true)
+        .use_delimiter(true)
+        .require_equals(true)
+        .help("Specify a policy file for subprocesses"),
+    )
+    .arg(
+      Arg::with_name("strict")
+        .long("strict")
+        .help("Force policyId to be equal to the utility name"),
+    )
+    .arg(
       Arg::with_name("allow-ffi")
         .long("allow-ffi")
         .min_values(0)
@@ -2199,6 +2216,17 @@ fn permission_args_parse(flags: &mut Flags, matches: &clap::ArgMatches) {
     let run_allowlist: Vec<String> = run_wl.map(ToString::to_string).collect();
     flags.allow_run = Some(run_allowlist);
     debug!("run allowlist: {:#?}", &flags.allow_run);
+  }
+
+  if let Some(policy_wl) = matches.values_of("policy-file") {
+    let policy_file: Vec<PathBuf> = policy_wl.map(PathBuf::from).collect();
+    flags.policy_file = Some(policy_file);
+    debug!("Policy file: {:#?}", &flags.policy_file);
+  }
+
+  if matches.is_present("strict") {
+    flags.strict = true;
+    debug!("Strict: {}", &flags.strict);
   }
 
   if let Some(ffi_wl) = matches.values_of("allow-ffi") {

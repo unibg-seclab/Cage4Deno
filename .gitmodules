@@ -9,3 +9,6 @@
 [submodule "test_util/wpt"]
 	path = test_util/wpt
 	url = https://github.com/web-platform-tests/wpt.git
+[submodule "ext/landlock"]
+	path = ext/landlock
+	url = git@github.com:landlock-lsm/rust-landlock.git

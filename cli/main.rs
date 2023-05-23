@@ -1445,7 +1445,6 @@ pub fn main() {
     eprintln!("{}: {}", colors::red_bold("error"), err.to_string());
     std::process::exit(1);
   }
-
   let flags = match flags::flags_from_vec(args) {
     Ok(flags) => flags,
     Err(err @ clap::Error { .. })
