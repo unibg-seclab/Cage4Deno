@@ -12,3 +12,6 @@
 [submodule "ext/landlock"]
 	path = ext/landlock
 	url = git@github.com:landlock-lsm/rust-landlock.git
+[submodule "dmng"]
+	path = dmng
+	url = git@github.com:unibg-seclab/dmng.git
